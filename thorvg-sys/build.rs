@@ -1083,7 +1083,16 @@ fn generate_bindings(thorvg_src: &Path, out_dir: &Path) {
     //     64-bit machine if only an i386 libclang is on the library
     //     path), which trips bindgen's debug-assert that
     //     `target_pointer_size() == size_of::<*mut ()>()`.
-    if is_cross {
+    //   * Android is special-cased ahead of both: see `ndk_bindgen_args`.
+    let android = (env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android"))
+        .then(|| ndk_bindgen_args(&target))
+        .flatten();
+
+    if let Some((target_arg, sysroot)) = android {
+        builder = builder
+            .clang_args(target_arg.split_whitespace())
+            .clang_arg(format!("--sysroot={}", sysroot.display()));
+    } else if is_cross {
         if let Some(inc) = cross_sysroot_include() {
             builder = builder.clang_arg(format!("-I{}", inc.display()));
         }
@@ -1103,6 +1112,42 @@ fn generate_bindings(thorvg_src: &Path, out_dir: &Path) {
     bindings
         .write_to_file(out_dir.join("bindings.rs"))
         .expect("Couldn't write bindings!");
+}
+
+/// Android cross builds: recover libclang's `--target` and `--sysroot` from
+/// the NDK compiler cc-rs was handed.
+///
+/// The NDK's clang does not accept `-print-sysroot`, so `cross_sysroot_include`
+/// always yields `None` here and the generic `<arch>-none-elf` path leaves
+/// libclang on its host defaults.  On a glibc build host those resolve
+/// `<stdint.h>` to `/usr/include`, whose `bits/libc-header-start.h` lives in a
+/// multiarch subdirectory that does not exist for the cross arch — a hard
+/// error.  macOS ships no glibc headers, so clang's own freestanding
+/// `stdint.h` answers instead and the bug is invisible there; it only bites on
+/// Linux hosts such as CI.
+///
+/// `CXX_<triple>` points at `<ndk>/toolchains/llvm/prebuilt/<host>/bin/clang++`,
+/// whose grandparent holds `sysroot/` with bionic's headers, so the NDK root,
+/// its version and the host tag all come along without being hardcoded.
+/// `CXXFLAGS_<triple>` carries the `--target=<triple><api>` the C++ is built
+/// with; reusing it verbatim keeps the bindings' ABI and API gating in step
+/// with the library they describe.
+///
+/// Returns `None` when those variables are absent (a non-cargokit build), in
+/// which case the caller falls back to the previous behaviour.
+fn ndk_bindgen_args(target: &str) -> Option<(String, PathBuf)> {
+    let lookup = |prefix: &str| {
+        env::var(format!("{prefix}_{target}"))
+            .or_else(|_| env::var(format!("{prefix}_{}", target.replace('-', "_"))))
+            .ok()
+    };
+    let cxx = lookup("CXX")?;
+    let sysroot = Path::new(&cxx).parent()?.parent()?.join("sysroot");
+    if !sysroot.is_dir() {
+        return None;
+    }
+    let target_arg = lookup("CXXFLAGS").unwrap_or_else(|| format!("--target={target}"));
+    Some((target_arg, sysroot))
 }
 
 /// Discover the cross-compiler's sysroot include directory via
