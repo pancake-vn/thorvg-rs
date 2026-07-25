@@ -46,6 +46,13 @@ expressions = []   # Lottie expressions via JerryScript (~200 KB RAM)
 threads     = []   # Multi-threaded TaskScheduler (std::thread)
 file-io     = []   # Filesystem I/O APIs (Picture::load, etc.)
 
+# Drop ThorVG's global `operator new`/`delete`. They only forward to
+# `tvg::malloc`, which is `std::malloc`, so the default operators reach the
+# same allocator — but their symbols collide at link time with an allocator
+# that defines the operators too (mimalloc's `override` does; ld64 rejects the
+# duplicate when both land in one static archive). Off by default.
+no-global-new = []
+
 [build-dependencies]
 bindgen = "0.71"
 cc = "1"

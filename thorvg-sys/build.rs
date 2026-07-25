@@ -30,7 +30,10 @@ fn build_vendored_cc(thorvg_src: &Path, manifest_dir: &Path, out_dir: &Path) {
     let target = TargetInfo::from_env();
     let multilib = cross_toolchain_multilib_args(&target);
 
-    let sources = collect_thorvg_sources(&src);
+    let mut sources = collect_thorvg_sources(&src);
+    if cfg!(feature = "no-global-new") {
+        strip_global_new_delete(&mut sources, &src, out_dir);
+    }
     let include_dirs = thorvg_include_dirs(thorvg_src, &src, out_dir);
 
     let mut build = configure_thorvg_build(&target, &multilib);
@@ -116,6 +119,78 @@ impl TargetInfo {
 // ---------------------------------------------------------------------------
 // Source / include enumeration
 // ---------------------------------------------------------------------------
+
+/// Replace `renderer/tvgInitializer.cpp` in `sources` with a copy in `out_dir`
+/// whose global `operator new`/`delete` definitions are `#if 0`'d out (cargo
+/// feature `no-global-new`).
+///
+/// Why a generated copy rather than an `#ifndef` in the source: `thorvg/` is a
+/// git submodule of another repository, so this crate cannot guard the source
+/// itself. The copy still compiles against the original include dirs — every
+/// thorvg source directory is already on the include path — so nothing else
+/// about the build changes.
+///
+/// The four definitions are contiguous at the end of the file, so everything
+/// from the first one to EOF is wrapped. If ThorVG ever moves them, the marker
+/// or the sanity check below fails the build loudly: silently compiling the
+/// operators back in would resurrect the duplicate-symbol link error this
+/// feature exists to prevent.
+fn strip_global_new_delete(sources: &mut [PathBuf], src: &Path, out_dir: &Path) {
+    const MARKER: &str = "void* operator new(std::size_t size)";
+    const EXPECTED: [&str; 4] = [
+        "void* operator new(std::size_t size)",
+        "void operator delete(void* ptr) noexcept",
+        "void* operator new[](std::size_t size)",
+        "void operator delete[](void* ptr) noexcept",
+    ];
+
+    let original = src.join("renderer/tvgInitializer.cpp");
+    let text = std::fs::read_to_string(&original)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", original.display()));
+
+    let cut = text.find(MARKER).unwrap_or_else(|| {
+        panic!(
+            "feature `no-global-new`: {} no longer contains `{MARKER}`. ThorVG moved or renamed \
+             its global operators — update strip_global_new_delete (leaving them in would bring \
+             back the duplicate-symbol link error against overriding allocators).",
+            original.display()
+        )
+    });
+
+    let tail = &text[cut..];
+    for signature in EXPECTED {
+        assert!(
+            tail.contains(signature),
+            "feature `no-global-new`: `{signature}` not found after the marker in {}; the tail \
+             being stripped no longer matches the four global operators.",
+            original.display()
+        );
+    }
+    assert!(
+        !tail.contains("Initializer::") && !tail.contains("THORVG_VERSION_NUMBER"),
+        "feature `no-global-new`: the region being stripped from {} now contains more than the \
+         global operators — stripping it would drop real API.",
+        original.display()
+    );
+
+    let patched = out_dir.join("tvgInitializer.no-global-new.cpp");
+    let contents = format!(
+        "{}#if 0 // global operator new/delete stripped: cargo feature `no-global-new`\n{}\n#endif\n",
+        &text[..cut],
+        tail.trim_end()
+    );
+    std::fs::write(&patched, contents)
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", patched.display()));
+
+    let slot = sources
+        .iter_mut()
+        .find(|path| **path == original)
+        .expect("renderer/tvgInitializer.cpp is always collected");
+    *slot = patched;
+
+    println!("cargo:rerun-if-changed={}", original.display());
+}
+
 
 /// Collect thorvg `.cpp` sources for the enabled cargo features.
 ///
